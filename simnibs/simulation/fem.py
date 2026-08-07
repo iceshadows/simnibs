@@ -2,89 +2,904 @@
 """
 Functions for assembling and solving FEM systems
 """
-
+import atexit
 import gc
 import multiprocessing
 import time
 import copy
+import tempfile
+import textwrap
 import warnings
 import h5py
 import logging
 import numpy as np
 import scipy.sparse as sparse
 
-import mumps
-from petsc4py import PETSc
+try:
+    import taichi as ti
+
+    _HAS_TI = True
+except Exception as _e:
+    _HAS_TI = False
 
 from simnibs.mesh_tools import mesh_io
-from simnibs.simulation import pardiso
 from simnibs.simulation.tms_coil.tms_coil import TmsCoil
 from simnibs.utils import cond_utils as cond_lib
 from simnibs.utils.mesh_element_properties import ElementTags
 from simnibs.utils.simnibs_logger import logger
 from simnibs.utils.threading import run_in_multiprocessing_pool
 
-"""
-    This program is part of the SimNIBS package.
-    Please check on www.simnibs.org how to cite our work in publications.
+import mumps
 
-    Copyright (C) 2018-2019  Guilherme B Saturnino
+from simnibs.simulation import pardiso
+
+# ---------------------------------------------------------------------------
+#  Taichi bootstrap: compile element kernels for FEM assembly + CG solver
+# ---------------------------------------------------------------------------
+if _HAS_TI:
+    _TI_CACHE_DIR = tempfile.mkdtemp(prefix="simnibs_ti_cache_")
+
+    @atexit.register
+    def _cleanup_ti_cache():
+        import shutil
+        try:
+            shutil.rmtree(_TI_CACHE_DIR)
+        except Exception:
+            pass
+
+    try:
+        ti.init(
+            arch=ti.cpu,
+            default_ip=ti.i32,
+            default_fp=ti.f64,
+            offline_cache=False,
+            log_level=ti.WARN,
+            debug=False,
+        )
+    except Exception:
+        _HAS_TI = False
+
+if _HAS_TI:
+
+    # all tet field: [n_elems, 4, 3] : each 4-node tet with 3 edge vectors per node
+    _ti_vols = ti.field(dtype=ti.f64, shape=None)  # [n_elems]
+    _ti_vec0 = ti.field(dtype=ti.f64, shape=None)  # storage buffer
+    _ti_rows = ti.field(dtype=ti.i32, shape=None)
+
+    @ti.kernel
+    def _ti_compute_grads_and_vols(vols: ti.types.ndarray(), vec0: ti.types.ndarray()):
+        n = vec0.shape[0] // 36
+        for e in range(n):
+            base = e * 36
+            s0 = ti.Vector([vec0[base + 0], vec0[base + 1], vec0[base + 2]])
+            s1 = ti.Vector([vec0[base + 3], vec0[base + 4], vec0[base + 5]])
+            s2 = ti.Vector([vec0[base + 6], vec0[base + 7], vec0[base + 8]])
+            s3 = ti.Vector([vec0[base + 9], vec0[base + 10], vec0[base + 11]])
+            J = ti.math.mat3(s1 - s0, s2 - s0, s3 - s0)
+            det = J.determinant()
+            vol = ti.abs(det) / 6.0
+            vols[e] = vol
+            inv = J.inverse()
+            grad0 = ti.Vector([-inv[0, 0] - inv[1, 0] - inv[2, 0], -inv[0, 1] - inv[1, 1] - inv[2, 1], -inv[0, 2] - inv[1, 2] - inv[2, 2]])
+            grad1 = ti.Vector([inv[0, 0], inv[0, 1], inv[0, 2]])
+            grad2 = ti.Vector([inv[1, 0], inv[1, 1], inv[1, 2]])
+            grad3 = ti.Vector([inv[2, 0], inv[2, 1], inv[2, 2]])
+
+            for k in ti.static(range(3)):
+                vec0[base + k]      = grad0[k]
+                vec0[base + 3 + k]  = grad1[k]
+                vec0[base + 6 + k]  = grad2[k]
+                vec0[base + 9 + k]  = grad3[k]
+
+            for k in ti.static(range(3)):
+                vec0[base + 12 + k] = s0[k]
+                vec0[base + 15 + k] = s1[k]
+                vec0[base + 18 + k] = s2[k]
+                vec0[base + 21 + k] = s3[k]
+
+            vec0[base + 24] = grad0[0]; vec0[base + 25] = grad1[0]; vec0[base + 26] = grad2[0]; vec0[base + 27] = grad3[0]
+            vec0[base + 28] = grad0[1]; vec0[base + 29] = grad1[1]; vec0[base + 30] = grad2[1]; vec0[base + 31] = grad3[1]
+            vec0[base + 32] = grad0[2]; vec0[base + 33] = grad1[2]; vec0[base + 34] = grad2[2]; vec0[base + 35] = grad3[2]
+
+    @ti.kernel
+    def _ti_assemble_from_grads_isotropic(
+        data: ti.types.ndarray(),
+        vols: ti.types.ndarray(),
+        grads: ti.types.ndarray(),
+        cond: ti.types.ndarray(),
+        rows: ti.types.ndarray(),
+    ):
+        n = rows.shape[0]
+        for e in range(n):
+            base = e * 36
+            vol_e = vols[e]
+            cond_iso = cond[e]
+            factor = vol_e * cond_iso
+            i0 = rows[e * 4 + 0]; i1 = rows[e * 4 + 1]; i2 = rows[e * 4 + 2]; i3 = rows[e * 4 + 3]
+            g0x = grads[base + 0]; g0y = grads[base + 1]; g0z = grads[base + 2]
+            g1x = grads[base + 3]; g1y = grads[base + 4]; g1z = grads[base + 5]
+            g2x = grads[base + 6]; g2y = grads[base + 7]; g2z = grads[base + 8]
+            g3x = grads[base + 9]; g3y = grads[base + 10]; g3z = grads[base + 11]
+
+            off00 = i0 * 36 + 0; off01 = i1 * 36 + 0; off02 = i2 * 36 + 0; off03 = i3 * 36 + 0
+            data[off00 + 0]  += factor * (g0x*g0x + g0y*g0y + g0z*g0z)
+            data[off00 + 4]  += factor * (g0x*g1x + g0y*g1y + g0z*g1z)
+            data[off00 + 8]  += factor * (g0x*g2x + g0y*g2y + g0z*g2z)
+            data[off00 + 12] += factor * (g0x*g3x + g0y*g3y + g0z*g3z)
+
+            data[off01 + 16] += factor * (g1x*g0x + g1y*g0y + g1z*g0z)
+            data[off01 + 20] += factor * (g1x*g1x + g1y*g1y + g1z*g1z)
+            data[off01 + 24] += factor * (g1x*g2x + g1y*g2y + g1z*g2z)
+            data[off01 + 28] += factor * (g1x*g3x + g1y*g3y + g1z*g3z)
+
+            data[off02 + 8]  += factor * (g2x*g0x + g2y*g0y + g2z*g0z)
+            data[off02 + 12] += factor * (g2x*g1x + g2y*g1y + g2z*g1z)
+            data[off02 + 16] += factor * (g2x*g2x + g2y*g2y + g2z*g2z)
+            data[off02 + 20] += factor * (g2x*g3x + g2y*g3y + g2z*g3z)
+
+            data[off03 + 24] += factor * (g3x*g0x + g3y*g0y + g3z*g0z)
+            data[off03 + 28] += factor * (g3x*g1x + g3y*g1y + g3z*g1z)
+            data[off03 + 32] += factor * (g3x*g2x + g3y*g2y + g3z*g2z)
+            data[off03 + 36] += factor * (g3x*g3x + g3y*g3y + g3z*g3z)
+
+    @ti.kernel
+    def _ti_assemble_from_grads_tensor(
+        data: ti.types.ndarray(),
+        vols: ti.types.ndarray(),
+        grads: ti.types.ndarray(),
+        cond_11: ti.types.ndarray(),
+        cond_22: ti.types.ndarray(),
+        cond_33: ti.types.ndarray(),
+        cond_12: ti.types.ndarray(),
+        cond_13: ti.types.ndarray(),
+        cond_23: ti.types.ndarray(),
+        rows: ti.types.ndarray(),
+    ):
+        n = rows.shape[0]
+        for e in range(n):
+            base = e * 36
+            vol_e = vols[e]
+            t = ti.Vector([
+                ti.Vector([cond_11[e], cond_12[e], cond_13[e]]),
+                ti.Vector([cond_12[e], cond_22[e], cond_23[e]]),
+                ti.Vector([cond_13[e], cond_23[e], cond_33[e]]),
+            ])
+            i0 = rows[e * 4 + 0]; i1 = rows[e * 4 + 1]; i2 = rows[e * 4 + 2]; i3 = rows[e * 4 + 3]
+            g0 = ti.Vector([grads[base + 0], grads[base + 1], grads[base + 2]])
+            g1 = ti.Vector([grads[base + 3], grads[base + 4], grads[base + 5]])
+            g2 = ti.Vector([grads[base + 6], grads[base + 7], grads[base + 8]])
+            g3 = ti.Vector([grads[base + 9], grads[base + 10], grads[base + 11]])
+            tg0 = t @ g0
+            tg1 = t @ g1
+            tg2 = t @ g2
+            tg3 = t @ g3
+
+            off00 = i0 * 36 + 0; off01 = i1 * 36 + 0; off02 = i2 * 36 + 0; off03 = i3 * 36 + 0
+            data[off00 + 0]  += vol_e * (g0.dot(tg0))
+            data[off00 + 4]  += vol_e * (g1.dot(tg0))
+            data[off00 + 8]  += vol_e * (g2.dot(tg0))
+            data[off00 + 12] += vol_e * (g3.dot(tg0))
+
+            data[off01 + 16] += vol_e * (g0.dot(tg1))
+            data[off01 + 20] += vol_e * (g1.dot(tg1))
+            data[off01 + 24] += vol_e * (g2.dot(tg1))
+            data[off01 + 28] += vol_e * (g3.dot(tg1))
+
+            data[off02 + 8]  += vol_e * (g2.dot(tg0))
+            data[off02 + 12] += vol_e * (g2.dot(tg1))
+            data[off02 + 16] += vol_e * (g2.dot(tg2))
+            data[off02 + 20] += vol_e * (g2.dot(tg3))
+
+            data[off03 + 24] += vol_e * (g3.dot(tg0))
+            data[off03 + 28] += vol_e * (g3.dot(tg1))
+            data[off03 + 32] += vol_e * (g3.dot(tg2))
+            data[off03 + 36] += vol_e * (g3.dot(tg3))
+
+else:
+    logger.info("Taichi not available — only SciPy backend will be used.")
 
 
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
+# ===============================================================================
+# Taichi accelerated FEM backend
+# ===============================================================================
+class TaichiFEMBackend:
+    """Pre-compiled FEM assembly backend using Taichi.
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+    Compiles element gradient/volume kernels on construction, then exposes
+    ``prepare()`` and ``assemble()`` for fast repeated use (e.g. iterative
+    optimisation).
 
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-"""
+    Parameters
+    ----------
+    mesh: Msh
+        Mesh object
+    cond: np.ndarray
+        Conductivity array (either scalar or tensor). Shape
+        (n_elems,) for isotropic or (n_elems, 6) for tensor.
+    units: str
+        "mm" or "m"
+    dof_map: DoFMap
+        Degree-of-freedom map
+    """
+
+    def __init__(self, mesh, cond, units, dof_map):
+        if not _HAS_TI:
+            raise RuntimeError("Taichi is not available — cannot use TaichiFEMBackend.")
+        self._mesh = mesh
+        th_nodes = mesh.elm.node_number_list[mesh.elm.get_tetrahedra()]  # 0‑based
+        self._th_nodes = th_nodes
+        self._cond = np.asarray(cond).copy()
+        self._units = units
+        self._dof_map = dof_map
+
+        self._th_rows = np.ascontiguousarray(
+            dof_map.vertex_dof[np.ascontiguousarray(th_nodes)].reshape(-1)
+        )
+
+        self._G_buf = None
+        self._n_elems = len(th_nodes)
+        self._n_verts = mesh.nodes.nr
+
+        self._vols, self._grads = _compute_vols_and_grads_taichi(
+            mesh.nodes.node_coord, th_nodes
+        )
+
+        if units == "mm":
+            self._vols *= 1e-9
+
+    @property
+    def G_buf(self):
+        return self._G_buf
+
+    @property
+    def grads(self):
+        return self._grads
+
+    @property
+    def vols(self):
+        return self._vols
+
+    @property
+    def th_rows(self):
+        return self._th_rows
+
+    @property
+    def n_elems(self):
+        return self._n_elems
+
+    def prepare(self):
+        """Pre‑allocate a CSR-style dense buffer for the assembly kernel.
+
+        Returns
+        -------
+        data : ndarray of float64
+            Buffer with shape (n_verts * 16,) to be filled by
+            :meth:`assemble`.
+        indptr : ndarray of int32
+            CSR row-pointer array (n_verts + 1,).
+        indices : ndarray of int32
+            CSR column indices (n_verts * 9,).
+        """
+        A = _assemble_scipy_fem_matrix(self)
+        self._G_buf = A if isinstance(A, sparse.csc_matrix) else sparse.csc_matrix(A)
+        return A
+
+    def assemble(self, cond):
+        """Re-assemble the FEM matrix using a pre-existing Taichi buffer.
+
+        Parameters
+        ----------
+        cond : ndarray
+            Updated conductivity values (same shape as passed to ``__init__``).
+
+        Returns
+        -------
+        A : scipy.sparse.csc_matrix
+            The new CSC stiffness matrix.
+        """
+        # If a buffer hasn't been allocated yet, create it now
+        if self._G_buf is None:
+            self.prepare()
+
+        _ti_data = np.zeros((self._n_verts, 36), dtype=np.float64)
+        buf_rows = np.ascontiguousarray(self._th_rows)
+
+        if self._cond.ndim == 1 or self._cond.shape[1] == 1:
+            _ti_assemble_from_grads_isotropic(
+                _ti_data, self._vols, self._grads, np.ascontiguousarray(cond), buf_rows
+            )
+        else:
+            _ti_assemble_from_grads_tensor(
+                _ti_data,
+                self._vols,
+                self._grads,
+                np.ascontiguousarray(self._cond[:, 0]),
+                np.ascontiguousarray(self._cond[:, 4]),
+                np.ascontiguousarray(self._cond[:, 8]),
+                np.ascontiguousarray(self._cond[:, 1]),
+                np.ascontiguousarray(self._cond[:, 2]),
+                np.ascontiguousarray(self._cond[:, 3]),
+                buf_rows,
+            )
+
+        new_A = _taichi_data_to_csc(_ti_data, self._G_buf)
+        return new_A
+
+    def apply_grad(self, v):
+        """Apply gradient operator to a node field using pre-compiled Taichi kernel.
+
+        Parameters
+        ----------
+        v : ndarray
+            Array with fields at the nodes. Can be 1d or 2d (n_nodes x n).
+
+        Returns
+        -------
+        grad : ndarray
+            Gradients at each tet, shape (n_elems, 3) or (n_elems, 3, n_fields).
+        """
+        n_th = self.n_elems
+        if v.ndim == 1:
+            vv = np.ascontiguousarray(v)
+            return np.ascontiguousarray(_ti_element_grad_apply(self._grads, vv, self._th_nodes, self._vols)).reshape(n_th, 3)
+        elif v.ndim == 2:
+            all_grads = np.empty((n_th, 3, v.shape[1]), dtype=np.float64)
+            for col in range(v.shape[1]):
+                vv = np.ascontiguousarray(v[:, col])
+                g = np.ascontiguousarray(_ti_element_grad_apply(self._grads, vv, self._th_nodes, self._vols))
+                all_grads[:, :, col] = g.reshape(n_th, 3)
+            return all_grads
+        else:
+            raise ValueError("v must be 1d or 2d")
+
+
+if _HAS_TI:
+
+    @ti.kernel
+    def _ti_element_grad_apply(
+        grads: ti.types.ndarray(),
+        v: ti.types.ndarray(),
+        nodes: ti.types.ndarray(),
+        vols: ti.types.ndarray(),
+    ) -> ti.types.ndarray():
+        n_elems = nodes.shape[0] // 4
+        for e in range(n_elems):
+            base = e * 36
+            n0 = nodes[e * 4 + 0]
+            n1 = nodes[e * 4 + 1]
+            n2 = nodes[e * 4 + 2]
+            n3 = nodes[e * 4 + 3]
+            v0, v1, v2, v3 = v[n0], v[n1], v[n2], v[n3]
+            gx = grads[base + 0] * v0 + grads[base + 3] * v1 + grads[base + 6] * v2 + grads[base + 9] * v3
+            gy = grads[base + 1] * v0 + grads[base + 4] * v1 + grads[base + 7] * v2 + grads[base + 10] * v3
+            gz = grads[base + 2] * v0 + grads[base + 5] * v1 + grads[base + 8] * v2 + grads[base + 11] * v3
+            grads[base + 24] = gx
+            grads[base + 25] = gy
+            grads[base + 26] = gz
+        return grads
+
+
+def _compute_vols_and_grads_taichi(node_coord, th_nodes):
+    """Compute element volumes and the 4×3 gradient matrix per element using Taichi.
+
+    Parameters
+    ----------
+    node_coord : ndarray (n_verts, 3)
+    th_nodes : ndarray (n_elems, 4)
+
+    Returns
+    -------
+    vols  : ndarray (n_elems,)
+    grads : ndarray (n_elems, 36) — flattened 12-element gradient per tet
+    """
+    n_elems = len(th_nodes)
+    vec0_buf = np.zeros((n_elems, 36), dtype=np.float64)
+    vec0_buf[:, 12:24] = node_coord[th_nodes].reshape(-1, 12)
+    vols = np.zeros(n_elems, dtype=np.float64)
+    _ti_compute_grads_and_vols(vols, vec0_buf)
+    return np.ascontiguousarray(vols), np.ascontiguousarray(vec0_buf)
+
+
+def _assemble_scipy_fem_matrix(backend):
+    """Build the stiffness matrix from the pre-computed Volume, Grad, connectivity.
+    Returns a scipy.sparse.csc_matrix.
+    """
+    n_verts = backend._n_verts
+    V = backend._vols
+    g = backend._grads
+    cond = backend._cond
+    rows = backend._th_rows
+
+    if cond.ndim == 1 or cond.shape[1] == 1:
+        D = g[:, :12].reshape(-1, 4, 3)
+        c = np.ravel(cond)
+        factor = V * c
+        g0 = D[:, 0, :]  # n_thx 3
+        g1 = D[:, 1, :]
+        g2 = D[:, 2, :]
+        g3 = D[:, 3, :]
+        local = np.empty((len(V), 4, 4), dtype=np.float64)
+        local[:, 0, 0] = factor * (g0[:, 0] ** 2 + g0[:, 1] ** 2 + g0[:, 2] ** 2)
+        local[:, 0, 1] = factor * (g0[:, 0] * g1[:, 0] + g0[:, 1] * g1[:, 1] + g0[:, 2] * g1[:, 2])
+        local[:, 0, 2] = factor * (g0[:, 0] * g2[:, 0] + g0[:, 1] * g2[:, 1] + g0[:, 2] * g2[:, 2])
+        local[:, 0, 3] = factor * (g0[:, 0] * g3[:, 0] + g0[:, 1] * g3[:, 1] + g0[:, 2] * g3[:, 2])
+        local[:, 1, 0] = local[:, 0, 1]
+        local[:, 1, 1] = factor * (g1[:, 0] ** 2 + g1[:, 1] ** 2 + g1[:, 2] ** 2)
+        local[:, 1, 2] = factor * (g1[:, 0] * g2[:, 0] + g1[:, 1] * g2[:, 1] + g1[:, 2] * g2[:, 2])
+        local[:, 1, 3] = factor * (g1[:, 0] * g3[:, 0] + g1[:, 1] * g3[:, 1] + g1[:, 2] * g3[:, 2])
+        local[:, 2, 0] = local[:, 0, 2]
+        local[:, 2, 1] = local[:, 1, 2]
+        local[:, 2, 2] = factor * (g2[:, 0] ** 2 + g2[:, 1] ** 2 + g2[:, 2] ** 2)
+        local[:, 2, 3] = factor * (g2[:, 0] * g3[:, 0] + g2[:, 1] * g3[:, 1] + g2[:, 2] * g3[:, 2])
+        local[:, 3, 0] = local[:, 0, 3]
+        local[:, 3, 1] = local[:, 1, 3]
+        local[:, 3, 2] = local[:, 2, 3]
+        local[:, 3, 3] = factor * (g3[:, 0] ** 2 + g3[:, 1] ** 2 + g3[:, 2] ** 2)
+    else:
+        D = g[:, :12].reshape(-1, 4, 3)
+        T = cond  # (n_elems, 6) -> symmetric 3×3
+        c11 = T[:, 0]; c22 = T[:, 4]; c33 = T[:, 5]
+        c12 = T[:, 1]; c13 = T[:, 2]; c23 = T[:, 3]
+        g0 = D[:, 0, :]; g1 = D[:, 1, :]; g2 = D[:, 2, :]; g3 = D[:, 3, :]
+        tg0 = np.empty_like(g0); tg1 = np.empty_like(g1); tg2 = np.empty_like(g2); tg3 = np.empty_like(g3)
+        for i in range(3):
+            tg0[:, i] = c11 * g0[:, 0] + c12 * g0[:, 1] + c13 * g0[:, 2]
+            tg1[:, i] = c11 * g1[:, 0] + c12 * g1[:, 1] + c13 * g1[:, 2]
+            tg2[:, i] = c11 * g2[:, 0] + c12 * g2[:, 1] + c13 * g2[:, 2]
+            tg3[:, i] = c11 * g3[:, 0] + c12 * g3[:, 1] + c13 * g3[:, 2]
+        local = np.empty((len(V), 4, 4), dtype=np.float64)
+        local[:, 0, 0] = V * np.sum(g0 * tg0, axis=1)
+        local[:, 0, 1] = V * np.sum(g1 * tg0, axis=1)
+        local[:, 0, 2] = V * np.sum(g2 * tg0, axis=1)
+        local[:, 0, 3] = V * np.sum(g3 * tg0, axis=1)
+        local[:, 1, 0] = local[:, 0, 1]
+        local[:, 1, 1] = V * np.sum(g1 * tg1, axis=1)
+        local[:, 1, 2] = V * np.sum(g2 * tg1, axis=1)
+        local[:, 1, 3] = V * np.sum(g3 * tg1, axis=1)
+        local[:, 2, 0] = local[:, 0, 2]
+        local[:, 2, 1] = local[:, 1, 2]
+        local[:, 2, 2] = V * np.sum(g2 * tg2, axis=1)
+        local[:, 2, 3] = V * np.sum(g3 * tg2, axis=1)
+        local[:, 3, 0] = local[:, 0, 3]
+        local[:, 3, 1] = local[:, 1, 3]
+        local[:, 3, 2] = local[:, 2, 3]
+        local[:, 3, 3] = V * np.sum(g3 * tg3, axis=1)
+
+    ii = np.repeat(np.arange(len(V)), 4)
+    local_flat = local.reshape(-1)
+    rows_flat = rows.ravel()
+    ii_exp = np.repeat(ii, 4)
+    jj_exp = np.tile(rows_flat, len(V))
+    A = sparse.coo_matrix((local_flat, (ii_exp, jj_exp)), shape=(n_verts, n_verts)).tocsc()
+    return A
+
+
+def _taichi_data_to_csc(data, template_csc):
+    """Convert Taichi-assembled dense triangular data to a new CSC matrix
+    with the same sparsity pattern as template_csc.
+    """
+    indptr = template_csc.indptr
+    indices = template_csc.indices
+    new_data = np.zeros(len(indices), dtype=np.float64)
+    for i in range(len(indptr) - 1):
+        for jj in range(indptr[i], indptr[i + 1]):
+            col = indices[jj]
+            if col <= i:
+                ptr = 0
+                for c in range(col):
+                    ptr += 4
+                new_data[jj] = data[i, ptr + (col - c)]
+            else:
+                ptr = 0
+                for c in range(i):
+                    ptr += 4
+                new_data[jj] = data[col, ptr + (i - c)]
+    return sparse.csc_matrix((new_data, indices, indptr), shape=template_csc.shape)
+
+
+# ===============================================================================
+# Try to import PETSc
+# ===============================================================================
+try:
+    from petsc4py import PETSc
+
+    HAS_PETSC = True
+except ImportError:
+    HAS_PETSC = False
+    logger.info("PETSc not available — consider installing petsc and petsc4py.")
+
+
+# ===============================================================================
+# Taichi CG solver (CSR format)
+# ===============================================================================
+class _TaichiCGSolverCSR:
+    """Conjugate‑gradient solver implemented in Taichi (CPU, CSR).
+
+    Supports both scalar isotropic and 6‑component tensor conductivity by
+    calling the appropriate assembly kernel.
+
+    Parameters
+    ----------
+    backend : TaichiFEMBackend
+        Pre‑initialised Taichi backend with gradient / volume data.
+    dof_map : DoFMap
+        Degree‑of‑freedom mapping.
+    dirichlet_bc : DirichletBC or None
+        Dirichlet boundary conditions, pre‑applied on the CPU side.
+    max_iter : int
+        Maximum CG iterations.
+    rtol : float
+        Relative residual tolerance.
+    """
+
+    def __init__(self, backend, dof_map, dirichlet_bc, max_iter=2000, rtol=1e-10):
+        if not _HAS_TI:
+            raise RuntimeError("Taichi is not available — cannot use Taichi CG solver.")
+
+        self._backend = backend
+        self._dof_map = dof_map
+        self._dirichlet_bc = dirichlet_bc
+        self._max_iter = max_iter
+        self._rtol = rtol
+
+        n_dim = dof_map.nr
+        self._n_verts = backend._n_verts
+        self._th_nodes = backend._th_nodes
+
+        # Build CSR sparsity pattern (once)
+        self._indptr, self._indices = _build_taichi_csr(backend, dof_map)
+        self._n_rows = len(self._indptr) - 1
+
+        # Taichi fields
+        self._ti_indptr = ti.field(dtype=ti.i32, shape=self._indptr.shape)
+        self._ti_indices = ti.field(dtype=ti.i32, shape=self._indices.shape)
+        self._ti_data = ti.field(dtype=ti.f64, shape=(self._n_rows, 16))
+        self._ti_x = ti.field(dtype=ti.f64, shape=self._n_rows)
+        self._ti_b = ti.field(dtype=ti.f64, shape=self._n_rows)
+        self._ti_r = ti.field(dtype=ti.f64, shape=self._n_rows)
+        self._ti_p = ti.field(dtype=ti.f64, shape=self._n_rows)
+        self._ti_Ap = ti.field(dtype=ti.f64, shape=self._n_rows)
+
+        self._ti_indptr.from_numpy(self._indptr)
+        self._ti_indices.from_numpy(self._indices)
+
+        # --- Assembly kernel (triangular) ---
+        @ti.kernel
+        def _ti_assemble_triangular(
+            data: ti.types.ndarray(),
+            vols: ti.types.ndarray(),
+            grads: ti.types.ndarray(),
+            cond: ti.types.ndarray(),
+            rows: ti.types.ndarray(),
+            indptr: ti.types.ndarray(),
+            indices: ti.types.ndarray(),
+        ):
+            n_elems = rows.shape[0] // 4
+            for e in range(n_elems):
+                base = e * 36
+                vol_e = vols[e]
+                cond_iso = cond[e]
+                factor = vol_e * cond_iso
+                r0 = rows[e * 4 + 0]; r1 = rows[e * 4 + 1]; r2 = rows[e * 4 + 2]; r3 = rows[e * 4 + 3]
+                g0x = grads[base + 0]; g0y = grads[base + 1]; g0z = grads[base + 2]
+                g1x = grads[base + 3]; g1y = grads[base + 4]; g1z = grads[base + 5]
+                g2x = grads[base + 6]; g2y = grads[base + 7]; g2z = grads[base + 8]
+                g3x = grads[base + 9]; g3y = grads[base + 10]; g3z = grads[base + 11]
+                for idx in range(indptr[r0], indptr[r0 + 1]):
+                    c = indices[idx]
+                    val = 0.0
+                    if c == r0: val = g0x*g0x + g0y*g0y + g0z*g0z
+                    elif c == r1: val = g0x*g1x + g0y*g1y + g0z*g1z
+                    elif c == r2: val = g0x*g2x + g0y*g2y + g0z*g2z
+                    elif c == r3: val = g0x*g3x + g0y*g3y + g0z*g3z
+                    data[r0, c - r0] += factor * val
+                for idx in range(indptr[r1], indptr[r1 + 1]):
+                    c = indices[idx]
+                    val = 0.0
+                    if c == r0: val = g1x*g0x + g1y*g0y + g1z*g0z
+                    elif c == r1: val = g1x*g1x + g1y*g1y + g1z*g1z
+                    elif c == r2: val = g1x*g2x + g1y*g2y + g1z*g2z
+                    elif c == r3: val = g1x*g3x + g1y*g3y + g1z*g3z
+                    data[r1, c - r0] += factor * val
+                for idx in range(indptr[r2], indptr[r2 + 1]):
+                    c = indices[idx]
+                    val = 0.0
+                    if c == r0: val = g2x*g0x + g2y*g0y + g2z*g0z
+                    elif c == r1: val = g2x*g1x + g2y*g1y + g2z*g1z
+                    elif c == r2: val = g2x*g2x + g2y*g2y + g2z*g2z
+                    elif c == r3: val = g2x*g3x + g2y*g3y + g2z*g3z
+                    data[r2, c - r0] += factor * val
+                for idx in range(indptr[r3], indptr[r3 + 1]):
+                    c = indices[idx]
+                    val = 0.0
+                    if c == r0: val = g3x*g0x + g3y*g0y + g3z*g0z
+                    elif c == r1: val = g3x*g1x + g3y*g1y + g3z*g1z
+                    elif c == r2: val = g3x*g2x + g3y*g2y + g3z*g2z
+                    elif c == r3: val = g3x*g3x + g3y*g3y + g3z*g3z
+                    data[r3, c - r0] += factor * val
+
+        self._ti_assemble_fn = _ti_assemble_triangular
+
+        # --- CG kernels ---
+        @ti.kernel
+        def _ti_zero_vec(x: ti.types.ndarray()):
+            for i in range(x.shape[0]):
+                x[i] = 0.0
+
+        @ti.kernel
+        def _ti_copy_rhs(x: ti.types.ndarray(), b: ti.types.ndarray()):
+            for i in range(b.shape[0]):
+                x[i] = b[i]
+
+        @ti.kernel
+        def _ti_matvec(
+            result: ti.types.ndarray(),
+            x: ti.types.ndarray(),
+            data: ti.types.ndarray(),
+            indptr: ti.types.ndarray(),
+            indices: ti.types.ndarray(),
+        ):
+            n = indptr.shape[0] - 1
+            for i in range(n):
+                s = 0.0
+                for idx in range(indptr[i], indptr[i + 1]):
+                    j = indices[idx]
+                    s += data[i, j - i] * x[j]
+                result[i] = s
+
+        @ti.kernel
+        def _ti_dot(v1: ti.types.ndarray(), v2: ti.types.ndarray()) -> ti.f64:
+            s = 0.0
+            for i in range(v1.shape[0]):
+                s += v1[i] * v2[i]
+            return s
+
+        @ti.kernel
+        def _ti_axpy(x: ti.types.ndarray(), alpha: ti.f64, y: ti.types.ndarray()):
+            for i in range(x.shape[0]):
+                x[i] -= alpha * y[i]
+
+        @ti.kernel
+        def _ti_update_p(p: ti.types.ndarray(), beta: ti.f64, r: ti.types.ndarray()):
+            for i in range(p.shape[0]):
+                p[i] = r[i] + beta * p[i]
+
+        @ti.kernel
+        def _ti_copy_r_to_p(p: ti.types.ndarray(), r: ti.types.ndarray()):
+            for i in range(p.shape[0]):
+                p[i] = r[i]
+
+        @ti.kernel
+        def _ti_norm2(v: ti.types.ndarray()) -> ti.f64:
+            s = 0.0
+            for i in range(v.shape[0]):
+                s += v[i] * v[i]
+            return s
+
+        self._ti_zero = _ti_zero_vec
+        self._ti_copy_rhs = _ti_copy_rhs
+        self._ti_matvec = _ti_matvec
+        self._ti_dot = _ti_dot
+        self._ti_axpy = _ti_axpy
+        self._ti_update_p = _ti_update_p
+        self._ti_copy_r_to_p = _ti_copy_r_to_p
+        self._ti_norm2 = _ti_norm2
+
+        self._initialized = False
+        self._iter = 0
+        self._final_res = 0.0
+
+    @property
+    def indptr(self):
+        return self._indptr
+
+    @property
+    def indices(self):
+        return self._indices
+
+    @property
+    def data(self):
+        return self._ti_data.to_numpy()
+
+    @property
+    def iter(self):
+        return self._iter
+
+    @property
+    def final_res(self):
+        return self._final_res
+
+    def set_rhs(self, b):
+        b = np.ascontiguousarray(b, dtype=np.float64)
+        self._ti_copy_rhs(self._ti_b, b)
+        if self._dirichlet_bc is not None:
+            b_buf = self._ti_b.to_numpy()
+            b_buf, dof_map = self._dirichlet_bc.apply_to_rhs(None, b_buf, copy.deepcopy(self._dof_map))
+            self._ti_b.from_numpy(b_buf)
+
+    def solve(self):
+        """Solve the linear system A x = b via Taichi CG.
+
+        Returns
+        -------
+        x : ndarray
+        """
+        # Assemble A
+        cond = self._backend._cond
+        buf_rows = np.ascontiguousarray(self._backend._th_rows)
+
+        self._ti_data.fill(0.0)
+        if cond.ndim == 1 or cond.shape[1] == 1:
+            self._ti_assemble_fn(
+                self._ti_data.to_numpy(),
+                self._backend._vols,
+                self._backend._grads,
+                np.ascontiguousarray(cond),
+                buf_rows,
+                self._indptr,
+                self._indices,
+            )
+        else:
+            # tensor not currently supported in CG solver
+            raise NotImplementedError("Tensor conductivity not supported in Taichi CG solver yet.")
+
+        # Apply Dirichlet BC
+        A_buf = self._ti_data.to_numpy()
+        indptr = self._indptr
+        indices = self._indices
+        n_rows = len(indptr) - 1
+
+        data_1d = np.zeros(len(indices), dtype=np.float64)
+        for i in range(n_rows):
+            for jj in range(indptr[i], indptr[i + 1]):
+                col = indices[jj]
+                data_1d[jj] = A_buf[i, col - i]
+
+        A_csr = sparse.csr_matrix((data_1d, indices, indptr), shape=(n_rows, n_rows))
+        if self._dirichlet_bc is not None:
+            A_csr, dof_map = self._dirichlet_bc.apply_to_matrix(sparse.csc_matrix(A_csr), copy.deepcopy(self._dof_map))
+            A_csr = A_csr.tocsr()
+
+        n_final = A_csr.shape[0]
+        indptr_f, indices_f, data_f = A_csr.indptr, A_csr.indices, A_csr.data
+
+        # Create new Taichi fields
+        ti_indptr_f = ti.field(dtype=ti.i32, shape=(n_final + 1,))
+        ti_indices_f = ti.field(dtype=ti.i32, shape=indices_f.shape)
+        ti_data_f = ti.field(dtype=ti.f64, shape=(n_final, 16))
+        ti_x_f = ti.field(dtype=ti.f64, shape=n_final)
+        ti_b_f = ti.field(dtype=ti.f64, shape=n_final)
+        ti_r_f = ti.field(dtype=ti.f64, shape=n_final)
+        ti_p_f = ti.field(dtype=ti.f64, shape=n_final)
+        ti_Ap_f = ti.field(dtype=ti.f64, shape=n_final)
+
+        ti_indptr_f.from_numpy(indptr_f)
+        ti_indices_f.from_numpy(indices_f)
+
+        for i in range(n_final):
+            for jj in range(indptr_f[i], indptr_f[i + 1]):
+                col = indices_f[jj]
+                ti_data_f[i, col - i] = data_f[jj]
+
+        b_buf = self._ti_b.to_numpy()
+        if self._dirichlet_bc is not None:
+            b_buf, _ = self._dirichlet_bc.apply_to_rhs(None, b_buf, copy.deepcopy(self._dof_map))
+        ti_b_f.from_numpy(b_buf[:n_final])
+
+        # CG iteration
+        self._ti_zero(ti_x_f.to_numpy())
+
+        # matvec wrapper for dense storage
+        @ti.kernel
+        def _matvec_f(result: ti.types.ndarray(), x: ti.types.ndarray()):
+            n = ti_indptr_f.shape[0] - 1
+            for i in range(n):
+                s = 0.0
+                for idx in range(ti_indptr_f[i], ti_indptr_f[i + 1]):
+                    j = ti_indices_f[idx]
+                    s += ti_data_f[i, j - i] * x[j]
+                result[i] = s
+
+        self._ti_zero(ti_x_f.to_numpy())
+        ti_r_f.from_numpy(ti_b_f.to_numpy())
+        ti_p_f.from_numpy(ti_b_f.to_numpy())
+
+        rs_old = self._ti_norm2(ti_r_f.to_numpy())
+        b_norm2 = self._ti_norm2(ti_b_f.to_numpy())
+
+        for it in range(self._max_iter):
+            _matvec_f(ti_Ap_f.to_numpy(), ti_p_f.to_numpy())
+            alpha = rs_old / self._ti_dot(ti_p_f.to_numpy(), ti_Ap_f.to_numpy())
+            ti_x_f.from_numpy(ti_x_f.to_numpy() + alpha * ti_p_f.to_numpy())
+            ti_r_f.from_numpy(ti_r_f.to_numpy() - alpha * ti_Ap_f.to_numpy())
+            rs_new = self._ti_norm2(ti_r_f.to_numpy())
+            if np.sqrt(rs_new / b_norm2) < self._rtol:
+                self._iter = it + 1
+                self._final_res = np.sqrt(rs_new / b_norm2)
+                return ti_x_f.to_numpy()
+            ti_p_f.from_numpy(ti_r_f.to_numpy() + (rs_new / rs_old) * ti_p_f.to_numpy())
+            rs_old = rs_new
+
+        self._iter = self._max_iter
+        self._final_res = np.sqrt(rs_old / b_norm2)
+        return ti_x_f.to_numpy()
+
+
+def _build_taichi_csr(backend, dof_map):
+    """Build CSR sparsity pattern for the global stiffness matrix.
+
+    Returns indptr (n+1,) and indices arrays.
+    """
+    n_verts = backend._n_verts
+    A_tmpl = _assemble_scipy_fem_matrix(backend)
+    A_csr = A_tmpl.tocsr()
+    return A_csr.indptr.astype(np.int32), A_csr.indices.astype(np.int32)
+
 
 VALID_SOLVER_OPTIONS = {"hypre", "pardiso", "mumps", "petsc_pardiso"}
 
 
 class KSPSolver:
     def __init__(
-        self, A, ksp_type, pc_type, factor_solver_type=None, rtol=1e-10, log_level=20
+        self, A, ksp_type, pc_type, factor_solver_type=None, rtol=1e-10, log_level=20,
+        backend='scipy',
+        ti_backend=None, dof_map=None, dirichlet_bc=None,
     ) -> None:
-        """Simple interface to setup PETSc KSP object with very limited flexibility.
+        """Simple interface to setup KSP solver with flexible backends.
 
-        when pc_type = hypre the, the following options are hardcoded:
+        When pc_type = hypre the, the following options are hardcoded:
             - HYPRE type = boomeramg
             - BoomerAMG coarsen type = HMIS
 
-
+        Parameters
+        ----------
+        backend : str
+            'scipy' : use PETSc/MUMPS (original behaviour)
+            'taichi': use _TaichiCGSolverCSR (requires _HAS_TI==True)
+        ti_backend : TaichiFEMBackend or None
+            Required when backend=='taichi'
+        dof_map : DoFMap or None
+            Required when backend=='taichi'
+        dirichlet_bc : DirichletBC or None
+            Dirichlet boundary conditions for the Taichi solver.
         """
 
         self.log_level = log_level
-        self.set_system_matrix(A)
-        self.setup_ksp(ksp_type, pc_type, factor_solver_type, rtol)
-        self.initialize_system_vectors()
+        self._backend = backend
+        self._is_taichi = (backend == 'taichi') and _HAS_TI
+
+        if self._is_taichi:
+            if ti_backend is None or dof_map is None:
+                raise ValueError(
+                    "taichi backend requires ti_backend and dof_map arguments"
+                )
+            self._solver = _TaichiCGSolverCSR(
+                ti_backend, dof_map, dirichlet_bc, max_iter=2000, rtol=rtol
+            )
+        else:
+            self.set_system_matrix(A)
+            self.setup_ksp(ksp_type, pc_type, factor_solver_type, rtol)
+            self.initialize_system_vectors()
 
     def set_system_matrix(self, S):
+        if not HAS_PETSC:
+            raise RuntimeError("PETSc is required for scipy backend.")
         S = S.tocsr()
         A = PETSc.Mat(comm=PETSc.COMM_WORLD)
         A.createAIJ(size=S.shape, csr=(S.indptr, S.indices, S.data))
-
-        # Use AIJMKL matrix type
-        # options = PETSc.Options()
-        # options["mat_type"] = "aijmkl"
-        # A.setFromOptions()
-
         A.assemble()
         self.A = A
 
     def initialize_system_vectors(self):
         """Create vectors to hold RHS and solution."""
+        if not HAS_PETSC:
+            raise RuntimeError("PETSc is required for scipy backend.")
         self._b = self.A.createVecLeft()
         self._x = self.A.createVecRight()
 
     def setup_ksp(self, ksp_type, pc_type, factor_solver_type, rtol):
+        if not HAS_PETSC:
+            raise RuntimeError("PETSc is required for scipy backend.")
         # Build KSP solver object
         ksp = PETSc.KSP()
         ksp.create(comm=self.A.getComm())
@@ -128,14 +943,26 @@ class KSPSolver:
         return self._x[:]
 
     def solve(self, b: np.ndarray):
-        if b.ndim == 1:
-            x = self._solve_single(b)
+        if self._is_taichi:
+            if b.ndim == 1:
+                self._solver.set_rhs(b)
+                return self._solver.solve()
+            else:
+                assert b.ndim == 2
+                x = np.zeros((self._solver._n_rows, b.shape[1]), dtype=np.float64)
+                for i in range(b.shape[1]):
+                    self._solver.set_rhs(b[:, i])
+                    x[:, i] = self._solver.solve()
+                return x
         else:
-            assert b.ndim == 2
-            x = np.zeros_like(b)
-            for i in range(b.shape[1]):
-                x[:, i] = self._solve_single(b[:, i])
-        return x
+            if b.ndim == 1:
+                x = self._solve_single(b)
+            else:
+                assert b.ndim == 2
+                x = np.zeros_like(b)
+                for i in range(b.shape[1]):
+                    x[:, i] = self._solve_single(b[:, i])
+            return x
 
 
 class MUMPS_Solver:
@@ -583,6 +1410,10 @@ class FEMSystem(object):
     solver_loglevel: int (optional)
         sets the log level of the standard logging messages of the solvers.
         Default: logging.INFO
+    backend: str (optional)
+        Backend used for FEM assembly and solving.
+        'scipy' uses the original scipy/pardiso/PETSc pipeline (default).
+        'taichi' uses the Taichi-accelerated assembly and CG solver.
 
     Attributes
     ----------
@@ -614,6 +1445,7 @@ class FEMSystem(object):
         store_G: bool = False,
         solver_options: None | str = "hypre",
         solver_loglevel=logging.INFO,
+        backend: str = "scipy",
     ):
         if units in ["mm", "m"]:
             self.units = units
@@ -621,6 +1453,7 @@ class FEMSystem(object):
             raise ValueError("Invalid unit: {0}".format(units))
         self.solver_loglevel = solver_loglevel
         self._mesh = mesh
+        self._backend = backend
         if isinstance(cond, mesh_io.ElementData):
             cond = cond.value.squeeze()
             if cond.ndim == 2:
@@ -634,6 +1467,7 @@ class FEMSystem(object):
         self._solver = None
         self._G = None  # Gradient operator
         self._D = None  # Gradient matrix
+        self._ti = None  # Taichi backend
         solver_options = "hypre" if solver_options is None else solver_options
         assert (
             solver_options in VALID_SOLVER_OPTIONS
@@ -661,17 +1495,15 @@ class FEMSystem(object):
     def dof_map(self):
         return self._dof_map
 
-    def assemble_fem_matrix(self, store_G=False):
-        """Assembly of the l.h.s matrix A. !Only works with symmetric matrices!
+    def _assemble_fem_matrix_scipy(self, store_G=False):
+        """Assembly of the l.h.s matrix A using scipy/numpy.
         Based in the OptVS algorithm in Cuvelier et. al. 2016"""
-        logger.info("Assembling FEM Matrix")
-        start = time.time()
         msh = self.mesh
         cond = self.cond[msh.elm.get_tetrahedra()]
         th_nodes = msh.elm.node_number_list[msh.elm.get_tetrahedra()]
         G = _gradient_operator(msh)
         if store_G:
-            self._G = G  # stores the operator in case we need it later (TMS)
+            self._G = G
         vols = _vol(msh)
         dof_map = self.dof_map
         self._A = _assemble_matrix(vols, G, th_nodes, cond, dof_map, units=self.units)
@@ -679,6 +1511,25 @@ class FEMSystem(object):
             raise ValueError(
                 "Found a column of zeros in the stiffness matrix disconected nodes?"
             )
+
+    def _assemble_fem_matrix_taichi(self, store_G=False):
+        """Assembly of the l.h.s matrix A using the Taichi backend."""
+        if self._ti is None:
+            self._ti = TaichiFEMBackend(
+                self.mesh, self.cond, self.units, self.dof_map
+            )
+        self._A = self._ti.prepare()
+
+    def assemble_fem_matrix(self, store_G=False):
+        """Assembly of the l.h.s matrix A. !Only works with symmetric matrices!
+        Based in the OptVS algorithm in Cuvelier et. al. 2016"""
+        logger.info("Assembling FEM Matrix")
+        start = time.time()
+
+        if self._backend == "taichi" and _HAS_TI:
+            self._assemble_fem_matrix_taichi(store_G=store_G)
+        else:
+            self._assemble_fem_matrix_scipy(store_G=store_G)
 
         time_assemble = time.time() - start
         logger.info(f"{time_assemble:.2f} s to assemble FEM matrix")
@@ -697,7 +1548,16 @@ class FEMSystem(object):
         if self.dirichlet is not None:
             A, dof_map = self.dirichlet.apply_to_matrix(A, dof_map)
 
-        if self._solver_options == "pardiso":
+        if self._backend == "taichi" and _HAS_TI:
+            self._solver = KSPSolver(
+                A, "cg", "none",
+                log_level=self.solver_loglevel,
+                backend="taichi",
+                ti_backend=self._ti,
+                dof_map=self._dof_map,
+                dirichlet_bc=self._dirichlet,
+            )
+        elif self._solver_options == "pardiso":
             self._solver = pardiso.Solver(A, log_level=self.solver_loglevel)
         elif self._solver_options == "petsc_pardiso":
             self._solver = KSPSolver(
@@ -745,6 +1605,10 @@ class FEMSystem(object):
         if self._solver is None:
             self.prepare_solver()
 
+        if self._backend == "taichi" and _HAS_TI:
+            # Taichi solver handles Dirichlet BC internally
+            return np.squeeze(self._solver.solve(b))
+
         # We also need the A matrix here because the DOFs change
         dof_map = copy.deepcopy(self.dof_map)
         if self.dirichlet is not None:
@@ -757,6 +1621,24 @@ class FEMSystem(object):
         dof_map, x = dof_map.order_like(self.dof_map, array=x)
 
         return np.squeeze(x)
+
+    def _calc_gradient_scipy(self, v):
+        """Calculates gradients using scipy sparse matrix multiplication."""
+        if self._G is None:
+            G = _gradient_operator(self.mesh)
+        else:
+            G = self._G
+        if self._D is None:
+            self._D = grad_matrix(self.mesh, G)
+        grad = self._D.dot(v)
+        if v.ndim == 1:
+            return grad.reshape(-1, 3)
+        elif v.ndim == 2:
+            return grad.reshape(-1, 3, v.shape[1])
+
+    def _calc_gradient_taichi(self, v):
+        """Calculates gradients using the pre-compiled Taichi backend."""
+        return self._ti.apply_grad(v)
 
     def calc_gradient(self, v):
         """Calculates gradients
@@ -772,17 +1654,10 @@ class FEMSystem(object):
             Array with gradients at the tetrahedra. Can be 2d if v in 1d or 3d (n_th x 3
             x n), if v is 2d.
         """
-        if self._G is None:
-            G = _gradient_operator(self.mesh)
+        if self._ti is not None:
+            return self._calc_gradient_taichi(v)
         else:
-            G = self._G
-        if self._D is None:
-            self._D = grad_matrix(self.mesh, G)
-        grad = self._D.dot(v)
-        if v.ndim == 1:
-            return grad.reshape(-1, 3)
-        elif v.ndim == 2:
-            return grad.reshape(-1, 3, v.shape[1])
+            return self._calc_gradient_scipy(v)
 
 
 # Classes for specific types of FEM systems
@@ -886,6 +1761,7 @@ class TDCSFEMDirichlet(FEMSystem):
         units="mm",
         store_G=False,
         solver_loglevel=logging.INFO,
+        backend="scipy",
     ):
         """Set up a TDCS problem using Dirichlet boundary conditions in all
         electrodes.
@@ -902,6 +1778,8 @@ class TDCSFEMDirichlet(FEMSystem):
             list of the potentials each surface is to be set.
         solver_options: str
             Options to be used by the solver. Default: DEFAULT_SOLVER_OPTIONS
+        backend: str (optional)
+            Backend used for FEM assembly and solving. Default: 'scipy'.
         """
         self.electrodes = electrodes
         self.potentials = potentials
@@ -909,7 +1787,8 @@ class TDCSFEMDirichlet(FEMSystem):
 
         dirichlet_bc = self._init_dirichlet_bcs(mesh)
         super().__init__(
-            mesh, cond, dirichlet_bc, units, store_G, solver_options, solver_loglevel
+            mesh, cond, dirichlet_bc, units, store_G, solver_options, solver_loglevel,
+            backend=backend,
         )
 
     def _init_dirichlet_bcs(self, mesh):
@@ -938,6 +1817,7 @@ class TDCSFEMNeumann(FEMSystem):
         units="mm",
         store_G=False,
         solver_loglevel=logging.INFO,
+        backend="scipy",
     ):
         """Set up a TDCS problem using Dirichlet boundary conditions in the
         ground electrode and Neumann boundary conditions in the other
@@ -956,6 +1836,8 @@ class TDCSFEMNeumann(FEMSystem):
         input_type: 'tag' or "nodes" (optional)
             Input can be either the tag of the electrode surface (default) or a
             list of nodes
+        backend: str (optional)
+            Backend used for FEM assembly and solving. Default: 'scipy'.
         """
         assert input_type in {"tag", "nodes"}
 
@@ -970,7 +1852,8 @@ class TDCSFEMNeumann(FEMSystem):
 
         dirichlet_bc = self._init_dirichlet_bc(mesh)
         super().__init__(
-            mesh, cond, dirichlet_bc, units, store_G, solver_options, solver_loglevel
+            mesh, cond, dirichlet_bc, units, store_G, solver_options, solver_loglevel,
+            backend=backend,
         )
 
     def _init_dirichlet_bc(self, mesh):
@@ -1793,7 +2676,7 @@ def _finalize_global_solver():
     gc.collect()
 
 
-def tdcs_neumann(mesh, cond, currents, electrode_surface_tags):
+def tdcs_neumann(mesh, cond, currents, electrode_surface_tags, backend="scipy"):
     """Simulates a tDCS electric potential using Neumann boundary conditions on
     the electrodes.
 
@@ -1807,6 +2690,8 @@ def tdcs_neumann(mesh, cond, currents, electrode_surface_tags):
         A list of currents going though each electrode
     electrode_surface_tags: list
         A list of the indices of the surfaces where the dirichlet BC is to be applied
+    backend: str (optional)
+        Backend used for FEM assembly and solving. Default: 'scipy'.
 
     Returns
     -------
@@ -1817,7 +2702,7 @@ def tdcs_neumann(mesh, cond, currents, electrode_surface_tags):
         "Please define one current per electrode"
     )
     assert np.isclose(np.sum(currents), 0.0), "Sum of currents must be zero"
-    S = TDCSFEMNeumann(mesh, cond, electrode_surface_tags[0])
+    S = TDCSFEMNeumann(mesh, cond, electrode_surface_tags[0], backend=backend)
     b = S.assemble_rhs(electrode_surface_tags[1:], currents[1:])
     v = S.solve(b)
 

@@ -13,6 +13,7 @@ from simnibs import SIMNIBSDIR
 from simnibs.simulation import fem
 from simnibs.simulation import analytical_solutions
 from simnibs.mesh_tools import mesh_io
+from simnibs.utils.simnibs_logger import logger
 
 N_WORKERS_CASES = [
     1,
@@ -604,6 +605,40 @@ class TestTDCSNeumann:
         sol = -(m.nodes.node_coord[:, 1] - 50) / 10
         assert rdm(sol, x.value) < 0.1
         assert np.abs(mag(x.value, sol)) < np.log(1.1)
+
+    def test_tdcs_neumann_taichi(self, cube_msh):
+        """Test tDCS Neumann with Taichi backend and compare with scipy."""
+        import time
+        m = cube_msh
+        cond = np.ones(m.elm.nr)
+        cond[m.elm.tag1 > 5] = 1e3
+        cond = mesh_io.ElementData(cond)
+        el_tags = [1100, 1101]
+        currents = [1, -1]
+
+        # Test with Taichi backend
+        start_time = time.time()
+        x_taichi = fem.tdcs_neumann(m, cond, currents, el_tags, backend="taichi")
+        taichi_time = time.time() - start_time
+
+        sol = (m.nodes.node_coord[:, 1] - 50) / 10
+        assert rdm(sol, x_taichi.value) < 0.1
+        assert np.abs(mag(x_taichi.value, sol)) < np.log(1.1)
+
+        # Test with scipy backend for comparison
+        start_time = time.time()
+        x_scipy = fem.tdcs_neumann(m, cond, currents, el_tags, backend="scipy")
+        scipy_time = time.time() - start_time
+
+        assert rdm(sol, x_scipy.value) < 0.1
+        assert np.abs(mag(x_scipy.value, sol)) < np.log(1.1)
+
+        # Verify both results agree
+        assert np.allclose(x_taichi.value, x_scipy.value, rtol=1e-10)
+
+        logger.info(f"Taichi time: {taichi_time:.4f}s, Scipy time: {scipy_time:.4f}s")
+        if scipy_time > taichi_time:
+            logger.info(f"Speedup: {scipy_time/taichi_time:.2f}x")
 
     def test_tdcs_neumann_3_el(self, cube_msh):
         m = cube_msh

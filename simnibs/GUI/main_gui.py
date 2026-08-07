@@ -41,6 +41,9 @@ from . import head_model_OGL
 from . import simulation_menu
 
 class TDCS_GUI(QtWidgets.QMainWindow):
+    backend = 'scipy'
+    solver = 'hypre'
+
     def __init__(self):
         super(TDCS_GUI, self).__init__()
 
@@ -138,7 +141,30 @@ class TDCS_GUI(QtWidgets.QMainWindow):
         file_browse_out.clicked.connect(self.outFolderDialog)
         layout.addWidget(file_browse_out, 6, 3, 1, 1)
 
+        # Add a select option for selecting runtime backend
+        tag_runtime = QtWidgets.QLabel("<b>Runtime:<\\b>")
+        layout.addWidget(tag_runtime, 7, 0, 1, 3)
+        self.runtime_combo = QtWidgets.QComboBox()
+        self.runtime_combo.addItems(["scipy", "taichi"])
+        self.runtime_combo.activated.connect(self.on_runtime_combo_selected)
+        layout.addWidget(self.runtime_combo, 8, 0, 1, 3)
+        # Add a select option for selecting solver
+        tag_solver = QtWidgets.QLabel("<b>Solver:<\\b>")
+        layout.addWidget(tag_solver, 9, 0, 1, 3)
+        self.solver_combo = QtWidgets.QComboBox()
+        self.solver_combo.addItems(["hypre", "pardiso", "petsc_pardiso", "mumps"])
+        self.solver_combo.activated.connect(self.on_solver_combo_selected)
+        layout.addWidget(self.solver_combo, 10, 0, 1, 3)
+
         self.select_file.setLayout(layout)
+
+    def on_runtime_combo_selected(self):
+        current_text = self.runtime_combo.currentText()
+        self.backend = current_text
+
+    def on_solver_combo_selected(self):
+        current_text = self.solver_combo.currentText()
+        self.solver = current_text
 
     def fileDialog(self):
         dialog = QtWidgets.QFileDialog(self)
@@ -248,7 +274,7 @@ class TDCS_GUI(QtWidgets.QMainWindow):
     # Adds a tdcs-type tab to the poslist tabs
     def addTdcsPoslistTab(self, tdcslist=None):
         if not tdcslist:
-            tdcslist = sim_struct.TDCSLIST()
+            tdcslist = sim_struct.TDCSLIST(backend=self.backend, solver_options=self.solver)
             self.session.poslists.append(tdcslist)
         elc_table = ElcTable(
             self.headModelWidget.glHeadModel,

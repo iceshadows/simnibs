@@ -1577,13 +1577,15 @@ class TDCSLIST(SimuList):
         fields to be calculated. valid fields are: 'v' , 'E', 'e', 'J', 'j', 'g', 's', 'D', 'q'
     """
 
-    def __init__(self, matlab_struct=None):
+    def __init__(self, matlab_struct=None, solver_options=None, backend=None):
         SimuList.__init__(self)
         # currents in A (not mA!; given per stimulator channel)
         self.currents = []
         self.electrode = []
         self.fnamefem = ""
         self.postprocess = "eEjJ"
+        self.solver_options = solver_options
+        self.backend = backend
 
         # internal to simnibs
         self.tdcs_msh_name = None
@@ -1591,6 +1593,9 @@ class TDCSLIST(SimuList):
 
         if matlab_struct is not None:
             self.read_mat_struct(matlab_struct)
+
+        if backend is not None:
+            logger.info(f'TDCSLIST initialized with backend={backend}, solver_options={solver_options}')
 
     @property
     def unique_channels(self):
