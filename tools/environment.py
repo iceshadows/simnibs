@@ -493,6 +493,7 @@ DEPENDENCIES = Dependencies(
     CondaPackage("conda-pack", tag="build"),
     CondaPackage("jinja2", tag="build"),
     CondaPackage("cgal-cpp", "5.5", comparison="eq", tag="build"),
+    CondaPackage("libboost-devel", "1.83", comparison="leq", tag="build"),
     CondaPackage("packaging", tag="build"),
     CondaPackage("setuptools-scm", tag="build"),
     CondaPackage("tbb-devel", platforms=["linux", "windows"], tag="build"),
