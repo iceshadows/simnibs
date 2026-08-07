@@ -498,6 +498,7 @@ DEPENDENCIES = Dependencies(
     CondaPackage("tbb-devel", platforms=["linux", "windows"], tag="build"),
 
     PipPackage("cython", tag="build"),
+    PipPackage("build", tag="build"),
 
     # Test
     # =========================================================================
