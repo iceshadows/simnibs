@@ -42,10 +42,7 @@ jobs:
           conda run -n simnibs_build python -m build --wheel
 
       - name: Install NSIS
-        run: |
-          choco install nsis -y
-          # Ensure makensis is on PATH
-          echo "${PROGRAMFILES(x86)}\\NSIS" >> $GITHUB_PATH
+        run: choco install nsis -y
 
       - name: Package installer
         run: |
