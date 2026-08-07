@@ -469,6 +469,7 @@ DEPENDENCIES = Dependencies(
     PipPackage("pyqt5", platforms=["darwin","linux"]),
     PipPackage("PyQt5", platforms="windows"),
     PipPackage("scipy"),
+    PipPackage("taichi"),
     IndexURL("torch", "2.6.0+cpu", ["linux", "windows"], url="https://download.pytorch.org/whl/cpu", platform_tags=dict(linux="linux_x86_64", windows="win_amd64")),
     # On MacOS, torch+cpu is simply the default package
     PipPackage("torch", "2.6.0", "darwin", comparison="eq"),
@@ -490,6 +491,7 @@ DEPENDENCIES = Dependencies(
     # Build
     # =========================================================================
     CondaPackage("conda-pack", tag="build"),
+    CondaPackage("jinja2", tag="build"),
     CondaPackage("cgal-cpp", "5.5", comparison="eq", tag="build"),
     CondaPackage("packaging", tag="build"),
     CondaPackage("setuptools-scm", tag="build"),

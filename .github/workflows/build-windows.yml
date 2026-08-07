@@ -1,0 +1,61 @@
+name: Build Windows Installer
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          python-version: '3.11'
+          channels: conda-forge
+          conda-remove-defaults: 'true'
+
+      - name: Generate environment files
+        run: |
+          python tools/environment.py create runtime -p windows -n simnibs_runtime -f ci_runtime.yml
+          python tools/environment.py create build -p windows -n simnibs_build -f ci_build.yml
+
+      - name: Create build environment
+        run: |
+          conda env create -n simnibs_build -f ci_build.yml
+
+      - name: Build SimNIBS wheel
+        run: |
+          conda run -n simnibs_build python -m build --wheel
+
+      - name: Install NSIS
+        run: |
+          choco install nsis -y
+          # Ensure makensis is on PATH
+          echo "${PROGRAMFILES(x86)}\\NSIS" >> $GITHUB_PATH
+
+      - name: Package installer
+        run: |
+          WHEEL=$(ls dist/simnibs-*.whl | head -1)
+          echo "Using wheel: $WHEEL"
+          conda run -n simnibs_build python packing/pack.py --env ci_runtime.yml --simnibs-wheel "$WHEEL"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simnibs-windows-installer
+          path: simnibs_installer_windows.exe
+          if-no-files-found: error

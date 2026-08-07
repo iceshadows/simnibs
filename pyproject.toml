@@ -35,6 +35,7 @@ dependencies = [
   "requests",
   "samseg",
   "scipy",
+  "taichi",
   "tbb ; sys_platform != 'darwin'",
   "gmsh",
 ]
