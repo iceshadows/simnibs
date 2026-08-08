@@ -276,6 +276,10 @@ class TDCS_GUI(QtWidgets.QMainWindow):
         if not tdcslist:
             tdcslist = sim_struct.TDCSLIST(backend=self.backend, solver_options=self.solver)
             self.session.poslists.append(tdcslist)
+        else:
+            # sync runtime backend from GUI to pre-existing poslists
+            # (e.g. loaded session: poslists may carry backend=None)
+            tdcslist.backend = self.backend
         elc_table = ElcTable(
             self.headModelWidget.glHeadModel,
             tdcslist,
@@ -554,7 +558,12 @@ class TDCS_GUI(QtWidgets.QMainWindow):
         for index in range(tab_count):
             widget = self.poslistTabWidget.widget(index)
             if widget.type == "tDCS":
-                self.session.poslists.append(widget.returnElAndCond())
+                poslist = widget.returnElAndCond()
+                # Always sync backend from the GUI runtime dropdown so a
+                # poslist created before switching to taichi uses the current
+                # selection when the simulation is run.
+                poslist.backend = self.backend
+                self.session.poslists.append(poslist)
             if widget.type == "TMS":
                 self.session.poslists.append(widget.returnCoilAndConds())
         return self.session

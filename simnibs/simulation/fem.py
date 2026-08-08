@@ -2,12 +2,12 @@
 """
 Functions for assembling and solving FEM systems
 """
-import atexit
 import gc
+import io
 import multiprocessing
+import sys
 import time
 import copy
-import tempfile
 import textwrap
 import warnings
 import h5py
@@ -37,19 +37,53 @@ from simnibs.simulation import pardiso
 #  Taichi bootstrap: compile element kernels for FEM assembly + CG solver
 # ---------------------------------------------------------------------------
 if _HAS_TI:
-    _TI_CACHE_DIR = tempfile.mkdtemp(prefix="simnibs_ti_cache_")
-
-    @atexit.register
-    def _cleanup_ti_cache():
-        import shutil
+    # Auto-detect the best available Taichi backend (GPU > CPU)
+    _TI_ARCH = ti.cpu
+    _TI_ARCH_NAME = "CPU"
+    _ARCH_CANDIDATES = [
+        (ti.cuda, "CUDA"),
+        (ti.vulkan, "Vulkan"),
+        (ti.metal, "Metal"),
+        (ti.opengl, "OpenGL"),
+    ]
+    for _arch, _name in _ARCH_CANDIDATES:
         try:
-            shutil.rmtree(_TI_CACHE_DIR)
+            if ti.is_arch_supported(_arch):
+                _TI_ARCH = _arch
+                _TI_ARCH_NAME = _name
+                break
         except Exception:
-            pass
+            continue
+
+    # Heal bad file descriptors that can occur in multiprocessing / GUI
+    # threads where stderr/stdout may have been redirected or closed.
+    try:
+        import os as _os
+        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
+        _bad_fds = {_devnull}
+        for _stream_name in ("stdout", "stderr"):
+            _stream = getattr(sys, _stream_name, None)
+            if _stream is None:
+                continue
+            try:
+                _fd = _stream.fileno()
+            except (OSError, io.UnsupportedOperation, AttributeError):
+                continue
+            try:
+                _os.fstat(_fd)
+            except OSError:
+                _bad_fds.add(_fd)
+        for _fd in _bad_fds:
+            try:
+                _os.dup2(_devnull, _fd)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
     try:
         ti.init(
-            arch=ti.cpu,
+            arch=_TI_ARCH,
             default_ip=ti.i32,
             default_fp=ti.f64,
             offline_cache=False,
@@ -58,6 +92,11 @@ if _HAS_TI:
         )
     except Exception:
         _HAS_TI = False
+    finally:
+        try:
+            _os.close(_devnull)
+        except Exception:
+            pass
 
 if _HAS_TI:
 
@@ -226,7 +265,11 @@ class TaichiFEMBackend:
         if not _HAS_TI:
             raise RuntimeError("Taichi is not available — cannot use TaichiFEMBackend.")
         self._mesh = mesh
-        th_nodes = mesh.elm.node_number_list[mesh.elm.get_tetrahedra()]  # 0‑based
+        th_nodes = mesh.elm.node_number_list[mesh.elm.get_tetrahedra()].copy()
+        # Gmsh/MSH format uses 1‑based node numbering in element connectivity,
+        # whereas dof_map._map is 0‑based. Convert to 0‑based if needed.
+        if th_nodes.size > 0 and np.min(th_nodes) >= 1:
+            th_nodes -= 1
         self._th_nodes = th_nodes
         self._cond = np.asarray(cond).copy()
         self._units = units
@@ -1168,6 +1211,8 @@ class dofMap(object):
         self._map = -99999 * np.ones(np.max(inverse) + 1, dtype=int)
         self._map[inverse] = np.arange(len(inverse), dtype=int)
         self.nr = len(inverse)
+        # Public read-only view: global vertex index → local dof index
+        self.vertex_dof = self._map
 
     def order_like(self, other_dof, array=None):
         sort = self.inverse.argsort()
@@ -1523,7 +1568,14 @@ class FEMSystem(object):
     def assemble_fem_matrix(self, store_G=False):
         """Assembly of the l.h.s matrix A. !Only works with symmetric matrices!
         Based in the OptVS algorithm in Cuvelier et. al. 2016"""
-        logger.info("Assembling FEM Matrix")
+        if self._backend == "taichi" and _HAS_TI:
+            logger.info(
+                f"Assembling FEM Matrix — Backend: taichi ({_TI_ARCH_NAME})"
+            )
+        else:
+            logger.info(
+                f"Assembling FEM Matrix — Backend: {self._backend} (CPU)"
+            )
         start = time.time()
 
         if self._backend == "taichi" and _HAS_TI:

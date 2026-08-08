@@ -1585,7 +1585,7 @@ class TDCSLIST(SimuList):
         self.fnamefem = ""
         self.postprocess = "eEjJ"
         self.solver_options = solver_options
-        self.backend = backend
+        self.backend = backend if backend is not None else "scipy"
 
         # internal to simnibs
         self.tdcs_msh_name = None
