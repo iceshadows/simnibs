@@ -1,5 +1,9 @@
 name: Build Windows Installer
 
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
 
 jobs:
   build-windows:
