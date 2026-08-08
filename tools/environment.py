@@ -504,7 +504,7 @@ DEPENDENCIES = Dependencies(
     # Test
     # =========================================================================
     CondaPackage("mock", tag="test"),
-    CondaPackage("pytest", tag="test"),
+    CondaPackage("pytest"),  # runtime dep: postinstall uses pytest for smoke test
 )
 # fmt: on
 

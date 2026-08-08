@@ -37,6 +37,12 @@ jobs:
         run: |
           conda env create -n simnibs_build -f ci_build.yml
 
+      - name: Patch CGAL for Boost 1.84+ compatibility
+        run: |
+          CGAL_HEADER="${CONDA}/envs/simnibs_build/include/CGAL/boost/graph/iterator.h"
+          echo "Patching $CGAL_HEADER ..."
+          sed -i 's/this->base()/this->base_reference()/g' "$CGAL_HEADER"
+
       - name: Build SimNIBS wheel
         run: |
           conda run -n simnibs_build python -m build --wheel
