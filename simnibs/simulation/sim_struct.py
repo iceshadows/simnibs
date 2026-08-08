@@ -1863,6 +1863,7 @@ class TDCSLIST(SimuList):
             np.unique(electrode_surfaces),
             solver_options=self.solver_options,
             n_workers=cpus,
+            backend=self.backend,
         )
         m = fem.calc_fields(v, self.postprocess, cond=cond)
         final_name = fn_simu + "_" + self.anisotropy_type + ".msh"

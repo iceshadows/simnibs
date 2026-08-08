@@ -2314,6 +2314,7 @@ def tdcs(
     n_workers=1,
     units="mm",
     solver_options=None,
+    backend="scipy",
 ):
     """Simulates a tDCS electric potential.
 
@@ -2352,11 +2353,12 @@ def tdcs(
     if n_workers == 1:
         for el_surf, el_c in zip(electrode_surface_tags[1:], currents[1:]):
             total_p += _sim_tdcs_pair(
-                mesh, cond, ref_electrode, el_surf, el_c, units, solver_options
+                mesh, cond, ref_electrode, el_surf, el_c, units, solver_options,
+                backend=backend,
             )
     else:
         args_list = [
-            (mesh, cond, ref_electrode, el_surf, el_c, units, solver_options)
+            (mesh, cond, ref_electrode, el_surf, el_c, units, solver_options, backend)
             for el_surf, el_c in zip(electrode_surface_tags[1:], currents[1:])
         ]
         result = run_in_multiprocessing_pool(n_workers, _sim_tdcs_pair, args_list)
@@ -2365,11 +2367,12 @@ def tdcs(
     return mesh_io.NodeData(total_p, "v", mesh=mesh)
 
 
-def _sim_tdcs_pair(mesh, cond, ref_electrode, el_surf, el_c, units, solver_options):
+def _sim_tdcs_pair(mesh, cond, ref_electrode, el_surf, el_c, units, solver_options, backend="scipy"):
     logger.info("Simulating electrode pair {0} - {1}".format(ref_electrode, el_surf))
 
     s = TDCSFEMDirichlet(
-        mesh, cond, [ref_electrode, el_surf], [0.0, 1.0], solver_options
+        mesh, cond, [ref_electrode, el_surf], [0.0, 1.0], solver_options,
+        backend=backend,
     )
     v = s.solve()
 
